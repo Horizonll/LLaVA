@@ -21,7 +21,8 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
-
+import threading
+import time
 import torch
 
 import transformers
@@ -414,6 +415,7 @@ def preprocess_llama_2(
 def preprocess_v1(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
+    clip_tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
@@ -445,7 +447,7 @@ def preprocess_v1(
             max_length=tokenizer.model_max_length,
             truncation=True,
         ).input_ids
-
+    clip_input_ids = clip_tokenizer(conversations, return_tensors="pt").input_ids
     targets = input_ids.clone()
 
     assert conv.sep_style == conversation_lib.SeparatorStyle.TWO
@@ -493,6 +495,7 @@ def preprocess_v1(
 
     return dict(
         input_ids=input_ids,
+        clip_input_ids=clip_input_ids,
         labels=targets,
     )
 
@@ -588,6 +591,7 @@ def preprocess_mpt(
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
+    clip_tokenizer: transformers.PreTrainedTokenizer
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
@@ -599,17 +603,24 @@ def preprocess_plain(
         conversations.append(conversation)
     # tokenize conversations
     input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    clip_input_ids = [
+        tokenizer_image_token(
+            prompt, clip_tokenizer, image_token_index=2867, return_tensors="pt"
+        )
+        for prompt in conversations
+    ]
+    # clip_input_ids = [clip_tokenizer(prompt, return_tensors='pt') for prompt in conversations][0]['input_ids']
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
         tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
         target[:tokenized_len] = IGNORE_INDEX
-
-    return dict(input_ids=input_ids, labels=targets)
+    return dict(input_ids=input_ids, clip_input_ids=clip_input_ids, labels=targets)
 
 
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
+    clip_tokenizer: transformers.PreTrainedTokenizer,
     has_image: bool = False
 ) -> Dict:
     """
@@ -620,11 +631,11 @@ def preprocess(
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-        return preprocess_plain(sources, tokenizer)
+        return preprocess_plain(sources, tokenizer, clip_tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
-        return preprocess_v1(sources, tokenizer, has_image=has_image)
+        return preprocess_v1(sources, tokenizer, clip_tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer, has_image=has_image)
     # add end signal and concatenate together
@@ -658,14 +669,19 @@ def preprocess(
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, data_path: str,
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: transformers.PreTrainedTokenizer,
+        data_args: DataArguments,
+        clip_tokenizer: transformers.PreTrainedTokenizer = None,
+):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
+        self.clip_tokenizer = clip_tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
 
@@ -724,9 +740,11 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
+            self.clip_tokenizer,
             has_image=('image' in self.list_data_dict[i]))
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             clip_input_ids=data_dict["clip_input_ids"][0],
                              labels=data_dict["labels"][0])
 
         # image exist in the data
@@ -746,8 +764,12 @@ class DataCollatorForSupervisedDataset(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
+        input_ids, labels, clip_input_ids = tuple([instance[key] for instance in instances]
+                                  for key in ("input_ids", "labels", "clip_input_ids"))
+        # input_ids, labels = tuple(
+        #     [instance[key] for instance in instances]
+        #     for key in ("input_ids", "labels")
+        # )
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -759,6 +781,7 @@ class DataCollatorForSupervisedDataset(object):
         labels = labels[:, :self.tokenizer.model_max_length]
         batch = dict(
             input_ids=input_ids,
+            clip_input_ids=clip_input_ids,
             labels=labels,
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
@@ -774,9 +797,11 @@ class DataCollatorForSupervisedDataset(object):
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
+                                data_args,
+                                clip_tokenizer: transformers.PreTrainedTokenizer=None) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                          clip_tokenizer=clip_tokenizer,
                                 data_path=data_args.data_path,
                                 data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
@@ -912,7 +937,7 @@ def train(attn_implementation=None):
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
@@ -955,14 +980,22 @@ def train(attn_implementation=None):
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
-
+    clip_tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.vision_tower)
     data_module = make_supervised_data_module(tokenizer=tokenizer,
+                                              clip_tokenizer=clip_tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+    def update_global_epoch():
+        while True:
+            with open("epoch.txt", "w") as f:
+                f.write(str(trainer.state.epoch))
+            time.sleep(5)
 
+    epoch_thread = threading.Thread(target=update_global_epoch, daemon=True)
+    epoch_thread.start()
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:

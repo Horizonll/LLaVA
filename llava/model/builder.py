@@ -163,5 +163,5 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         context_len = model.config.max_sequence_length
     else:
         context_len = 2048
-
-    return tokenizer, model, image_processor, context_len
+    clip_tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-large-patch14-336")
+    return tokenizer, clip_tokenizer, model, image_processor, context_len

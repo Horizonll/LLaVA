@@ -139,12 +139,17 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
+        # image_features = self.get_model().mm_projector(image_features)
+        return image_features
+
+    def encode_images_(self, images):
+        images = images.to(self.get_model().mm_projector[0].weight.dtype)
+        image_features = self.get_model().mm_projector(images)
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
-        self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        self, input_ids, clip_input_ids, position_ids, attention_mask, past_key_values, labels,
+        images, image_sizes=None, global_epoch=None
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -201,6 +206,67 @@ class LlavaMetaForCausalLM(ABC):
         else:
             image_features = self.encode_images(images)
 
+        k = 576
+        if global_epoch is not None:
+            if global_epoch < 0.33:
+                k = 100
+            elif global_epoch < 0.66:
+                k = 300
+            else:
+                k = 360
+        if clip_input_ids is not None:
+            image_features_ = torch.empty(image_features.size(0), k, image_features.size(2), device=image_features.device)
+            for i in range(len(clip_input_ids)):
+                clip_input_id = clip_input_ids[i].squeeze(0)
+                clip_input_id = [
+                    clip_input_id[i : i + 20] for i in range(0, clip_input_id.size(0), 20)
+                ]
+                clip_input_id = [
+                    self.get_model().get_vision_tower().encode_clip_text(i)
+                    for i in clip_input_id
+                ]
+                # FIXME: how to get 768
+                clip_input_id = torch.cat(
+                    [i.view(-1, 768) for i in clip_input_id], dim=0
+                )
+                clip_input_embed = (
+                    self.get_model()
+                    .get_vision_tower()
+                    .text_projection(clip_input_id.to(torch.float))
+                    # .text_projection(clip_input_id)
+                ).squeeze(0).mean(0) # 文本特征平均
+                image_feature = image_features[i]
+                image_feature = (
+                    self.get_model()
+                    .get_vision_tower()
+                    .vision_projection(image_feature.to(torch.float))
+                    # .vision_projection(image_feature)
+                    .squeeze(0)
+                )
+                attn = torch.functional.F.cosine_similarity(clip_input_embed, image_feature, dim=1)
+
+                # attn = torch.nn.functional.softmax(attn, dim=1)
+                topk_indices = torch.topk(attn, k-1).indices
+
+                # 新增：聚类并平均
+                # 1. 取出topk的特征作为中心
+                centers = image_features[i][topk_indices]  # (k-1, dim)
+                all_features = image_features[i]           # (n, dim)
+                # 2. 计算所有特征与中心的内积，分配到最近的中心
+                sim = torch.matmul(all_features, centers.t())  # (n, k-1)
+                nearest_center = sim.argmax(dim=1)  # (n,)
+                # 3. 对每个中心，聚合归类到该中心的特征并取平均
+                new_features = []
+                for idx in range(k-1):
+                    mask = (nearest_center == idx)
+                    if mask.sum() > 0:
+                        mean_feat = all_features[mask].mean(dim=0)
+                    else:
+                        mean_feat = centers[idx]
+                    new_features.append(mean_feat)
+                new_features = torch.stack(new_features, dim=0)
+                image_features_[i] = torch.cat([image_features[i][0].unsqueeze(0), new_features], dim=0) # 保留cls token
+            image_features = self.encode_images_(image_features_)
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError

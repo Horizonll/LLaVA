@@ -47,7 +47,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.global_epoch = None
+        self._epoch_read_step = 0
+        self._epoch_read_interval = 50
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -57,6 +59,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        clip_input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -69,6 +72,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        if self.global_epoch is None or self._epoch_read_step % self._epoch_read_interval == 0:
+            with open("epoch.txt", "r") as f:
+                a = f.read().strip()
+                if a.isdigit():
+                    self.global_epoch = float(a)
+        self._epoch_read_step += 1
 
         if inputs_embeds is None:
             (
@@ -77,15 +86,17 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 inputs_embeds,
-                labels
+                labels,
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids,
+                clip_input_ids,
                 position_ids,
                 attention_mask,
                 past_key_values,
                 labels,
                 images,
-                image_sizes
+                image_sizes,
+                self.global_epoch,
             )
 
         return super().forward(
@@ -105,6 +116,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def generate(
         self,
         inputs: Optional[torch.Tensor] = None,
+        clip_inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
@@ -124,12 +136,14 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 _
             ) = self.prepare_inputs_labels_for_multimodal(
                 inputs,
+                clip_inputs,
                 position_ids,
                 attention_mask,
                 None,
                 None,
                 images,
-                image_sizes=image_sizes
+                image_sizes=image_sizes,
+                global_epoch=1
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
